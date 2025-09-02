@@ -38,3 +38,4 @@ echo "Logs:"
 echo " - 42: /tmp/42.log"
 echo " - cFS: /tmp/cfs.log"
 echo " - Telemetry: /tmp/telemetry.log"
+
