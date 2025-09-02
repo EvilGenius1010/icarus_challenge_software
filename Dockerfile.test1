@@ -1,0 +1,111 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Install Build Dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential cmake git wget curl ca-certificates \
+    python3 python3-pip jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create Non-root User
+RUN useradd -ms /bin/bash osk
+WORKDIR /home/osk
+
+# Build NASA cFS
+RUN git clone --recurse-submodules https://github.com/nasa/cFS.git
+WORKDIR /home/osk/cFS
+RUN cp cfe/cmake/Makefile.sample Makefile && \
+    cp -r cfe/cmake/sample_defs . && \
+    make prep && make && make install
+
+# Build 42 (Headless)
+WORKDIR /home/osk
+RUN git clone https://github.com/ericstoneking/42.git
+WORKDIR /home/osk/42
+RUN sed -i 's/-D _ENABLE_GUI_//g' Makefile && \
+    sed -i 's/-D _USE_GLUT_//g' Makefile && \
+    sed -i 's/-D _USE_SHADERS_//g' Makefile && \
+    sed -i 's/-I \/usr\/include\/GL\///g' Makefile && \
+    sed -i 's/-lglut -lGLU -lGL -lXmu -lXi -lX11//g' Makefile && \
+    sed -i '/Object\/42gl\.o/d' Makefile && \
+    make
+
+# Create 42 minimal config (FIXED: Proper RUN command structure)
+RUN mkdir -p /home/osk/42/InOut
+RUN echo "****************** 42: Spacecraft Simulator ******************" > /home/osk/42/InOut/Sim.txt
+RUN echo "FALSE                       ! Echo to stdout" >> /home/osk/42/InOut/Sim.txt
+RUN echo "TRUE                        ! Quiet" >> /home/osk/42/InOut/Sim.txt
+RUN echo "FALSE                       ! Graphics Enable" >> /home/osk/42/InOut/Sim.txt
+RUN echo "0.1                         ! Sim Step Size (sec)" >> /home/osk/42/InOut/Sim.txt
+RUN echo "3600.0                      ! Duration (sec)" >> /home/osk/42/InOut/Sim.txt
+RUN echo "2000 01 01 12 00 00.0       ! Date and Time (UTC)" >> /home/osk/42/InOut/Sim.txt
+RUN echo "1                           ! Number of Spacecraft" >> /home/osk/42/InOut/Sim.txt
+RUN echo "SC_Simple.txt               ! Spacecraft Description File" >> /home/osk/42/InOut/Sim.txt
+RUN echo "Orb_LEO.txt                 ! Orbit Description File" >> /home/osk/42/InOut/Sim.txt
+RUN echo "NONE                        ! Graphics Input File" >> /home/osk/42/InOut/Sim.txt
+RUN echo "NONE                        ! Command Script File" >> /home/osk/42/InOut/Sim.txt
+
+# Build-time fault injection
+ARG MOCK_FAULT_URL="https://mockapi.example.com/api/get_faults"
+ARG TEAM_ID="default_team"
+
+RUN mkdir -p /home/osk/src && \
+    echo "{\"team_id\":\"${TEAM_ID}\",\"request_type\":\"cpp_faults\"}" > /home/osk/payload.json && \
+    (curl -s -X POST "${MOCK_FAULT_URL}" \
+        -H "Content-Type: application/json" \
+        --data-binary @/home/osk/payload.json \
+        -o /home/osk/faulty_code.tar.gz && \
+    tar -xzf /home/osk/faulty_code.tar.gz -C /home/osk/src/ || \
+    echo "Using default faulty files") && \
+    rm -f /home/osk/payload.json /home/osk/faulty_code.tar.gz
+
+# Copy C++ source files
+COPY cpp_files/ /home/osk/cpp_files
+
+# Create cFS ADCS Application directories
+RUN mkdir -p /home/osk/cFS/apps/space_adcs/fsw/src && \
+    mkdir -p /home/osk/cFS/apps/space_adcs/fsw/for_build
+
+# Copy ADCS app integration files
+COPY cpp_files/adcs_controller.cpp /home/osk/cFS/apps/space_adcs/fsw/src/
+COPY cpp_files/adcs_controller.h /home/osk/cFS/apps/space_adcs/fsw/src/
+
+# Add ADCS app to cFS startup (FIXED - removed invalid cmake line)
+RUN echo "CFE_APP, space_adcs, SpaceADCS_AppMain, SPACE_ADCS, 80, 16384, 0x0, 0;" >> /home/osk/cFS/build/exe/cpu1/cfe_es_startup.scr
+
+# Rebuild cFS with ADCS app
+WORKDIR /home/osk/cFS
+RUN make clean && make && make install
+
+
+# Debug: List files to verify they exist
+RUN ls -la /home/osk/cpp_files
+
+# Compile C++ controllers (FIXED - absolute paths)
+WORKDIR /home/osk
+RUN g++ -fPIC -shared -o libadcs_controllers.so \
+    cpp_files/adcs_controller.cpp \
+    cpp_files/microcontroller.cpp \
+    cpp_files/pid_controller.cpp
+
+
+# Copy Python and Shell files instead of using heredocs
+COPY telemetry_bridge.py /home/osk/telemetry_bridge.py
+COPY start_all.sh /home/osk/start_all.sh
+
+RUN chmod +x /home/osk/start_all.sh /home/osk/telemetry_bridge.py && \
+    chown -R osk:osk /home/osk
+
+USER osk
+
+ENV SIM_TIME=3600
+ENV ALTITUDE_THRESHOLD=10.0
+ENV TEAM_ID=default
+
+EXPOSE 1234/udp 1235/udp 1236/udp
+
+WORKDIR /home/osk
+CMD [ "/bin/bash" ]
+# CMD ["/home/osk/start_all.sh"]
